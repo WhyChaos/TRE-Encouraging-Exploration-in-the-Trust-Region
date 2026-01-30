@@ -17,6 +17,7 @@
 Single Process Actor
 """
 
+import functools
 import itertools
 import logging
 import os
@@ -28,7 +29,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, kl_penalty
+from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, kl_penalty, get_global_entropy_top_mask
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.device import get_device_name, get_torch_device, is_cuda_available, is_npu_available
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -72,13 +73,48 @@ class DataParallelPPOActor(BasePPOActor):
             if self.config.get("use_torch_compile", True)  #  use torch compile by default
             else verl_F.entropy_from_logits
         )
+        
+        # Support for top-k entropy calculation
+        self.entropy_top_k = self.config.get("entropy_top_k", None)
+        self.entropy_top_p = self.config.get("entropy_top_p", None)
+        if self.entropy_top_k is not None and self.entropy_top_p is not None:
+            raise ValueError("Only one of entropy_top_k and entropy_top_p can be set.")
+        if self.entropy_top_p is not None:
+            # Create a partial function with top_p parameter
+            self.compute_entropy_top_p_from_logits = (
+                torch.compile(
+                    functools.partial(verl_F.entropy_from_logits, top_p=self.entropy_top_p),
+                    dynamic=True
+                )
+                if self.config.get("use_torch_compile", True)
+                else functools.partial(verl_F.entropy_from_logits, top_p=self.entropy_top_p)
+            )
+            self.compute_entropy_top_k_from_logits = None
+        elif self.entropy_top_k is not None:
+            # Create a partial function with top_k parameter
+            self.compute_entropy_top_k_from_logits = (
+                torch.compile(
+                    functools.partial(verl_F.entropy_from_logits, top_k=self.entropy_top_k),
+                    dynamic=True
+                )
+                if self.config.get("use_torch_compile", True)
+                else functools.partial(verl_F.entropy_from_logits, top_k=self.entropy_top_k)
+            )
+            self.compute_entropy_top_p_from_logits = None
+        else:
+            self.compute_entropy_top_k_from_logits = None
+            self.compute_entropy_top_p_from_logits = None
+        
         self.device_name = get_device_name()
 
-    def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False, calculate_topk_prob_sum=False, topk_for_prob_sum=10) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
-            entropy: # (bs, response_len)
+            entropy: # (bs, response_len) or None
+            entropy_top_k: # (bs, response_len) or None (only if entropy_top_k is configured)
+            entropy_top_p: # (bs, response_len) or None (only if entropy_top_p is configured)
             log_probs: # (bs, response_len)
+            topk_prob_sum: # (bs, response_len) or None (only if calculate_topk_prob_sum is True)
         """
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
@@ -149,6 +185,7 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
                     entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
+                    topk_prob_sum_rmpad = None  # Not supported with fused kernels
 
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
@@ -156,7 +193,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
-                    if calculate_entropy:
+                    if calculate_entropy or calculate_topk_prob_sum:
                         inplace_backward = False
                     log_probs = logprobs_from_logits(
                         logits=logits_rmpad,
@@ -167,6 +204,23 @@ class DataParallelPPOActor(BasePPOActor):
                     # compute entropy
                     if calculate_entropy:
                         entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
+                        if self.compute_entropy_top_k_from_logits is not None:
+                            entropy_top_k_rmpad = self.compute_entropy_top_k_from_logits(logits_rmpad)
+                        else:
+                            entropy_top_k_rmpad = None
+                        if self.compute_entropy_top_p_from_logits is not None:
+                            entropy_top_p_rmpad = self.compute_entropy_top_p_from_logits(logits_rmpad)
+                        else:
+                            entropy_top_p_rmpad = None
+                    else:
+                        entropy_top_k_rmpad = None
+                        entropy_top_p_rmpad = None
+                    
+                    # compute top-k probability sum
+                    if calculate_topk_prob_sum:
+                        topk_prob_sum_rmpad = verl_F.topk_prob_sum_from_logits(logits_rmpad, k=topk_for_prob_sum)  # ((total_nnz / sp) + pad)
+                    else:
+                        topk_prob_sum_rmpad = None
 
                 # gather log_prob if sp > 1
                 if self.use_ulysses_sp:
@@ -184,6 +238,27 @@ class DataParallelPPOActor(BasePPOActor):
                             unpad_dim=0,
                             padding_size=pad_size,
                         )
+                        if entropy_top_k_rmpad is not None:
+                            entropy_top_k_rmpad = gather_outpus_and_unpad(
+                                entropy_top_k_rmpad,
+                                gather_dim=0,
+                                unpad_dim=0,
+                                padding_size=pad_size,
+                            )
+                        if entropy_top_p_rmpad is not None:
+                            entropy_top_p_rmpad = gather_outpus_and_unpad(
+                                entropy_top_p_rmpad,
+                                gather_dim=0,
+                                unpad_dim=0,
+                                padding_size=pad_size,
+                            )
+                    if calculate_topk_prob_sum and topk_prob_sum_rmpad is not None:
+                        topk_prob_sum_rmpad = gather_outpus_and_unpad(
+                            topk_prob_sum_rmpad,
+                            gather_dim=0,
+                            unpad_dim=0,
+                            padding_size=pad_size,
+                        )
                 # pad back to (bsz, seqlen)
                 if calculate_entropy:
                     full_entropy = pad_input(
@@ -192,6 +267,38 @@ class DataParallelPPOActor(BasePPOActor):
                         batch=batch_size,
                         seqlen=seqlen,
                     )
+                    if entropy_top_k_rmpad is not None:
+                        full_entropy_top_k = pad_input(
+                            hidden_states=entropy_top_k_rmpad.unsqueeze(-1),
+                            indices=indices,
+                            batch=batch_size,
+                            seqlen=seqlen,
+                        )
+                    else:
+                        full_entropy_top_k = None
+                    if entropy_top_p_rmpad is not None:
+                        full_entropy_top_p = pad_input(
+                            hidden_states=entropy_top_p_rmpad.unsqueeze(-1),
+                            indices=indices,
+                            batch=batch_size,
+                            seqlen=seqlen,
+                        )
+                    else:
+                        full_entropy_top_p = None
+                else:
+                    full_entropy_top_k = None
+                    full_entropy_top_p = None
+                
+                if calculate_topk_prob_sum and topk_prob_sum_rmpad is not None:
+                    full_topk_prob_sum = pad_input(
+                        hidden_states=topk_prob_sum_rmpad.unsqueeze(-1),
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                else:
+                    full_topk_prob_sum = None
+                    
                 full_log_probs = pad_input(
                     hidden_states=log_probs.unsqueeze(-1),
                     indices=indices,
@@ -202,6 +309,23 @@ class DataParallelPPOActor(BasePPOActor):
                 # only return response part:
                 if calculate_entropy:
                     entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
+                    if full_entropy_top_k is not None:
+                        entropy_top_k = full_entropy_top_k.squeeze(-1)[:, -response_length - 1 : -1]
+                    else:
+                        entropy_top_k = None
+                    if full_entropy_top_p is not None:
+                        entropy_top_p = full_entropy_top_p.squeeze(-1)[:, -response_length - 1 : -1]
+                    else:
+                        entropy_top_p = None
+                else:
+                    entropy_top_k = None
+                    entropy_top_p = None
+                
+                if calculate_topk_prob_sum and full_topk_prob_sum is not None:
+                    topk_prob_sum = full_topk_prob_sum.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
+                else:
+                    topk_prob_sum = None
+                    
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
 
             else:  # not using rmpad and no ulysses sp
@@ -220,6 +344,9 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     log_probs = output.log_probs[:, -response_length - 1 : -1]
                     entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
+                    entropy_top_k = None
+                    entropy_top_p = None
+                    topk_prob_sum = None  # Not supported with fused kernels
 
                 else:
                     logits = output.logits
@@ -229,8 +356,25 @@ class DataParallelPPOActor(BasePPOActor):
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
                     if calculate_entropy:
                         entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
+                        if self.compute_entropy_top_k_from_logits is not None:
+                            entropy_top_k = self.compute_entropy_top_k_from_logits(logits)
+                        else:
+                            entropy_top_k = None
+                        if self.compute_entropy_top_p_from_logits is not None:
+                            entropy_top_p = self.compute_entropy_top_p_from_logits(logits)
+                        else:
+                            entropy_top_p = None
+                    else:
+                        entropy_top_k = None
+                        entropy_top_p = None
+                    
+                    # Calculate top-k probability sum if requested
+                    if calculate_topk_prob_sum:
+                        topk_prob_sum = verl_F.topk_prob_sum_from_logits(logits, k=topk_for_prob_sum)  # (bsz, response_length)
+                    else:
+                        topk_prob_sum = None
 
-            return entropy, log_probs
+            return entropy, entropy_top_k, entropy_top_p, log_probs, topk_prob_sum
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -293,19 +437,31 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         entropy_lst = []
+        entropy_top_k_lst = []
+        entropy_top_p_lst = []
         for micro_batch in micro_batches:
             if isinstance(micro_batch, DataProto):
                 micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                entropy, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature, calculate_entropy=calculate_entropy)
+                entropy, entropy_top_k, entropy_top_p, log_probs, _ = self._forward_micro_batch(micro_batch, temperature=temperature, calculate_entropy=calculate_entropy)
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
+                if entropy_top_k is not None:
+                    entropy_top_k_lst.append(entropy_top_k)
+                if entropy_top_p is not None:
+                    entropy_top_p_lst.append(entropy_top_p)
 
         log_probs = torch.concat(log_probs_lst, dim=0)
         entropys = None
+        entropys_top_k = None
+        entropys_top_p = None
         if calculate_entropy:
             entropys = torch.concat(entropy_lst, dim=0)
+            if entropy_top_k_lst:
+                entropys_top_k = torch.concat(entropy_top_k_lst, dim=0)
+            if entropy_top_p_lst:
+                entropys_top_p = torch.concat(entropy_top_p_lst, dim=0)
         if use_dynamic_bsz:
             indices = list(itertools.chain.from_iterable(indices))
             assert len(indices) == log_probs.size(0), f"{len(indices)} vs. {log_probs.size()}"
@@ -384,10 +540,30 @@ class DataParallelPPOActor(BasePPOActor):
 
                     # all return: (bsz, response_length)
                     calculate_entropy = False
-                    if entropy_coeff != 0:
+                    entropy_top_ratio = self.config.get('entropy_top_ratio', None)
+                    if entropy_top_ratio is not None and not (0 <= entropy_top_ratio <= 1):
+                        raise ValueError(f"Invalid {entropy_top_ratio=}")
+                    
+                    if entropy_coeff != 0 or entropy_top_ratio is not None:
                         calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)
+                    
+                    # Check if we should calculate top-k probability sum
+                    calculate_topk_prob_sum = self.config.get('calculate_topk_prob_sum', False)
+                    topk_for_prob_sum = self.config.get('topk_for_prob_sum', 10)
+                    
+                    entropy, entropy_top_k, entropy_top_p, log_prob, topk_prob_sum = self._forward_micro_batch(
+                        micro_batch=data, 
+                        temperature=temperature, 
+                        calculate_entropy=calculate_entropy,
+                        calculate_topk_prob_sum=calculate_topk_prob_sum,
+                        topk_for_prob_sum=topk_for_prob_sum
+                    )
 
+                    entropy_top_mask = None
+                    if entropy_top_ratio is not None:
+                        entropy_top_mask = get_global_entropy_top_mask(entropy=entropy, response_mask=response_mask, top_ratio=entropy_top_ratio)
+
+                    kl_cov = self.config.get('kl_cov', None)
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
@@ -398,13 +574,25 @@ class DataParallelPPOActor(BasePPOActor):
                         cliprange_high=clip_ratio_high,
                         clip_ratio_c=clip_ratio_c,
                         loss_agg_mode=loss_agg_mode,
+                        entropy_top_mask=entropy_top_mask,
+                        kl_cov=kl_cov,
                     )
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
                         # compute policy loss
-                        policy_loss = pg_loss - entropy_loss * entropy_coeff
+                        # Use entropy_top_k or entropy_top_p if available, otherwise use full entropy
+                        if entropy_top_k is not None and self.entropy_top_p is not None:
+                            raise ValueError("Only one of entropy_top_k and entropy_top_p can be set.")
+                        if entropy_top_k is not None:
+                            entropy_top_k_loss = agg_loss(loss_mat=entropy_top_k, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                            policy_loss = pg_loss - entropy_top_k_loss * entropy_coeff
+                        elif entropy_top_p is not None:
+                            entropy_top_p_loss = agg_loss(loss_mat=entropy_top_p, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                            policy_loss = pg_loss - entropy_top_p_loss * entropy_coeff
+                        else:
+                            policy_loss = pg_loss - entropy_loss * entropy_coeff
                     else:
                         policy_loss = pg_loss
 
@@ -431,6 +619,12 @@ class DataParallelPPOActor(BasePPOActor):
                         "actor/ppo_kl": ppo_kl.detach().item(),
                         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
                     }
+                    
+                    # Log top-k probability sum if calculated
+                    if calculate_topk_prob_sum and topk_prob_sum is not None:
+                        topk_prob_sum_mean = agg_loss(loss_mat=topk_prob_sum, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        data[f"actor/topk{topk_for_prob_sum}_prob_sum"] = topk_prob_sum_mean.detach().item()
+                    
                     append_to_dict(metrics, data)
 
                 grad_norm = self._optimizer_step()

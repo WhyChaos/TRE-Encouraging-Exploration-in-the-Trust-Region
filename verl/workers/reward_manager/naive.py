@@ -39,6 +39,10 @@ class NaiveRewardManager:
             else:
                 return data.batch["rm_scores"]
 
+        # Support batch processing for HH dataset
+        if len(data) > 0 and data[0].non_tensor_batch.get(self.reward_fn_key) == "hh":
+            return self._compute_hh_batch(data, return_dict)
+
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
         reward_extra_info = defaultdict(list)
 
@@ -103,6 +107,42 @@ class NaiveRewardManager:
             return {
                 "reward_tensor": reward_tensor,
                 "reward_extra_info": reward_extra_info,
+            }
+        else:
+            return reward_tensor
+
+    def _compute_hh_batch(self, data, return_dict=False):
+        from verl.utils.reward_score import hh
+        
+        response_strs = []
+        ground_truths = []
+        valid_response_lengths = []
+        
+        for i in range(len(data)):
+            data_item = data[i]
+            
+            # Extract response string logic (simplified from loop)
+            prompt_ids = data_item.batch["prompts"]
+            prompt_length = prompt_ids.shape[-1]
+            
+            response_ids = data_item.batch["responses"]
+            valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
+            valid_response_ids = response_ids[:valid_response_length]
+            
+            response_strs.append(self.tokenizer.decode(valid_response_ids, skip_special_tokens=True))
+            ground_truths.append(data_item.non_tensor_batch["reward_model"]["ground_truth"])
+            valid_response_lengths.append(valid_response_length)
+            
+        scores = hh.compute_score_batch(response_strs, ground_truths)
+        
+        reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
+        for i, score in enumerate(scores):
+            reward_tensor[i, valid_response_lengths[i] - 1] = score
+            
+        if return_dict:
+            return {
+                "reward_tensor": reward_tensor,
+                "reward_extra_info": defaultdict(list),
             }
         else:
             return reward_tensor

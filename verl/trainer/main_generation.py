@@ -72,6 +72,27 @@ def main_task(config):
 
     # read dataset. Note that the dataset should directly contain chat template format (e.g., a list of dictionary)
     dataset = pd.read_parquet(config.data.path)
+    
+    # Check required columns
+    if "data_source" not in dataset.columns:
+        raise ValueError(f"'data_source' column not found in dataset: {config.data.path}. "
+                        f"Available columns: {list(dataset.columns)}")
+    
+    # Check for ground truth - can be in 'answer', 'ground_truth', or 'reward_model' dict
+    has_ground_truth = False
+    if "answer" in dataset.columns or "ground_truth" in dataset.columns:
+        has_ground_truth = True
+    elif "reward_model" in dataset.columns:
+        # Check if reward_model contains ground_truth
+        first_reward_model = dataset["reward_model"].iloc[0]
+        if isinstance(first_reward_model, dict) and "ground_truth" in first_reward_model:
+            has_ground_truth = True
+    
+    if not has_ground_truth:
+        raise ValueError(f"Ground truth not found in dataset: {config.data.path}. "
+                        f"Expected 'answer', 'ground_truth' column, or 'ground_truth' in 'reward_model' dict. "
+                        f"Available columns: {list(dataset.columns)}")
+    
     chat_lst = dataset[config.data.prompt_key].tolist()
 
     chat_lst = [chat.tolist() for chat in chat_lst]
@@ -139,6 +160,14 @@ def main_task(config):
     output_dir = os.path.dirname(config.data.output_path)
     makedirs(output_dir, exist_ok=True)
     dataset.to_parquet(config.data.output_path)
+    
+    # Print summary
+    print(f"\n{'='*60}")
+    print(f"Generation completed!")
+    print(f"Total samples: {len(dataset)}")
+    print(f"Saved to: {config.data.output_path}")
+    print(f"Saved columns: {list(dataset.columns)}")
+    print(f"{'='*60}\n")
 
 
 if __name__ == "__main__":

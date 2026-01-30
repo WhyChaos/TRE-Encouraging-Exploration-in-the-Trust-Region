@@ -122,11 +122,164 @@ def clip_by_value(x, tensor_min, tensor_max):
     return clipped
 
 
-def entropy_from_logits(logits: torch.Tensor):
-    """Calculate entropy from logits."""
-    pd = torch.nn.functional.softmax(logits, dim=-1)
-    entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
+def entropy_from_logits(logits: torch.Tensor, top_k: Optional[int] = None, top_p: Optional[float] = None):
+    """Calculate entropy from logits.
+    
+    Args:
+        logits (torch.Tensor): Logits tensor of shape (..., vocab_size)
+        top_k (Optional[int]): If specified, only compute entropy over top_k logits.
+                              Defaults to None (use full vocab).
+        top_p (Optional[float]): If specified, only compute entropy over tokens whose
+                               cumulative probability is within top_p. Defaults to None.
+    
+    Returns:
+        torch.Tensor: Entropy values of shape (...,)
+    """
+    if top_k is not None and top_p is not None:
+        raise ValueError("Only one of top_k or top_p can be specified.")
+    if top_k is not None and top_k < 1:
+        raise ValueError("top_k must be at least 1.")
+    if top_p is not None and (top_p >= 1.0 or top_p <= 0.0):
+        raise ValueError("top_p must be in the range (0.0, 1.0).")
+
+    if top_p is not None:
+        # Step 1: Compute probabilities - this is necessary for top-p
+        probs = torch.nn.functional.softmax(logits, dim=-1)
+        
+        # Step 2: Use topk instead of full sort to save memory
+        # For typical top_p values (0.9-0.99), we don't need many tokens
+        # Use a reasonable upper bound that covers most cases
+        max_k = min(256, logits.shape[-1])
+        
+        # topk on probs gives us the highest probability tokens (already sorted descending)
+        topk_probs, topk_indices = torch.topk(probs, k=max_k, dim=-1)
+        
+        # Free probs tensor early to save memory
+        del probs
+        
+        # Step 3: Compute cumulative probabilities on the small topk set
+        cumsum_probs = torch.cumsum(topk_probs, dim=-1)
+        # shifted_cumsum[i] = cumsum_probs[i-1], with shifted_cumsum[0] = 0
+        shifted_cumsum = torch.cat([torch.zeros_like(cumsum_probs[..., :1]), cumsum_probs[..., :-1]], dim=-1)
+        cutoff_mask = shifted_cumsum < top_p
+        
+        # Ensure at least the most probable token is included
+        cutoff_mask[..., 0] = True
+        
+        # Count selected tokens
+        selected_count = cutoff_mask.sum(dim=-1)
+        
+        # Handle case where only one token is selected - return zeros directly
+        single_token_mask = (selected_count == 1)
+        if single_token_mask.all():
+            return torch.zeros_like(logits[..., 0])
+        
+        # Gather the original logits for top-k tokens
+        topk_logits = torch.gather(logits, dim=-1, index=topk_indices)
+        
+        # Use full max_k to avoid .item() which causes graph break in torch.compile
+        # The unselected positions will be masked anyway
+        selected_logits = topk_logits
+        expanded_cutoff_mask = cutoff_mask
+        
+        # Free intermediate tensors
+        del topk_logits, topk_probs, topk_indices, cumsum_probs, shifted_cumsum, cutoff_mask
+        
+        # Set unselected logits to very negative value (effectively 0 probability after softmax)
+        selected_logits = torch.where(expanded_cutoff_mask, selected_logits, torch.full_like(selected_logits, -1e10))
+        
+        # Step 5: Compute softmax only on selected logits
+        pd = torch.nn.functional.softmax(selected_logits, dim=-1)
+        
+        # Step 6: Compute entropy
+        entropy = torch.logsumexp(selected_logits, dim=-1) - torch.sum(pd * selected_logits, dim=-1)
+        
+        # Step 7: Scale entropy to match full vocab entropy range: [0, log(vocab_size)]
+        # Each position uses its own selected_count for scaling
+        vocab_size = logits.shape[-1]
+        # Clamp to min 2 to avoid log(1)=0 division; positions with count=1 will be zeroed anyway
+        scale_factor = math.log(vocab_size) / torch.log(selected_count.float().clamp(min=2.0))
+        entropy = entropy * scale_factor
+        
+        # Set entropy to 0 for positions with only one token
+        entropy = torch.where(single_token_mask, torch.zeros_like(entropy), entropy)
+
+    elif top_k is not None:
+        if top_k == 1:
+            # Special case: compute Min-entropy (Rényi entropy with α=∞)
+            # H_∞(P) = -log(max P(x)) = logsumexp(logits) - max(logits)
+            # This measures the negative log-probability of the most likely token
+            return torch.logsumexp(logits, dim=-1) - torch.max(logits, dim=-1)[0]
+
+        # Get top-k logits
+        topk_logits, _ = torch.topk(logits, k=top_k, dim=-1)
+        
+        # Compute softmax probabilities
+        pd = torch.nn.functional.softmax(topk_logits, dim=-1)
+        
+        # Compute entropy
+        entropy = torch.logsumexp(topk_logits, dim=-1) - torch.sum(pd * topk_logits, dim=-1)
+        
+        # Scale to match full vocab entropy range: [0, log(vocab_size)]
+        vocab_size = logits.shape[-1]
+        entropy = entropy * (math.log(vocab_size) / math.log(top_k))
+        
+        # Register hook to project out gradient component that would change sum(exp(z))
+        # This ensures the top-k probability mass is preserved during backprop
+        # Note: We recompute pd inside the hook to avoid keeping it in memory via closure
+        # if topk_logits.requires_grad:
+        #     def geometric_preserving_hook(grad):
+        #         # Handle None gradient (can happen when gradient is not needed)
+        #         if grad is None:
+        #             return None
+        #         # Goal: ensure sum(exp(z) * dz) = 0, i.e., gradient is orthogonal to exp(z)
+        #         # Recompute pd from topk_logits to avoid memory overhead from closure capture
+        #         with torch.no_grad():
+        #             pd_recomputed = torch.nn.functional.softmax(topk_logits, dim=-1)
+        #             # Compute projection: (grad · pd) / ||pd||^2 * pd
+        #             dot_prod = torch.sum(grad * pd_recomputed, dim=-1, keepdim=True)
+        #             norm_sq = torch.sum(pd_recomputed * pd_recomputed, dim=-1, keepdim=True)
+        #             grad_projected = grad - (dot_prod / (norm_sq + 1e-10)) * pd_recomputed
+        #         return grad_projected
+            
+        #     topk_logits.register_hook(geometric_preserving_hook)
+    else:
+        # Original logic: use full vocabulary
+        pd = torch.nn.functional.softmax(logits, dim=-1)
+        entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
+    
     return entropy
+
+
+def topk_prob_sum_from_logits(logits: torch.Tensor, k: int = 10):
+    """Calculate the sum of top-k token probabilities from logits.
+    
+    This function computes the sum of probabilities for the top-k most likely tokens
+    at each position.
+    
+    Args:
+        logits (torch.Tensor): Logits tensor of shape (..., vocab_size)
+        k (int): Number of top tokens to consider. Defaults to 10.
+    
+    Returns:
+        torch.Tensor: Sum of top-k probabilities of shape (...,)
+    """
+    # Get top-k logits
+    topk_logits, _ = torch.topk(logits, k=min(k, logits.shape[-1]), dim=-1)
+    
+    # Compute softmax probabilities on the full logits
+    probs = torch.nn.functional.softmax(logits, dim=-1)
+    
+    # Get the indices of top-k logits
+    _, topk_indices = torch.topk(logits, k=min(k, logits.shape[-1]), dim=-1)
+    
+    # Gather the probabilities of top-k tokens
+    topk_probs = torch.gather(probs, dim=-1, index=topk_indices)
+    
+    # Sum the top-k probabilities
+    prob_sum = topk_probs.sum(dim=-1)
+    
+    return prob_sum
 
 
 def masked_sum(values, mask, axis=None):
