@@ -24,11 +24,19 @@ We propose **Trust Region Entropy (TRE)**, a novel exploration regularization te
 
 ## 🚀 Environment Setup
 
+<details>
+<summary>Click to expand</summary>
+
 Our code is based on [verl 0.4.x](https://github.com/verl-project/verl/tree/v0.4.x). Please follow the instructions in the original [`README_verl.md`](README_verl.md) for environment installation.
+
+</details>
 
 ---
 
 ## 🎯 Training
+
+<details>
+<summary>Click to expand</summary>
 
 ### Math Task
 
@@ -184,7 +192,7 @@ bash experiments/hh/7b_ppo_kl_cov.sh
 **TRE-K (Ours)**
 ```bash
 bash experiments/hh/1.5b_ppo_tre_k.sh
-bash experiments/countdown/7b_ppo_tre_k.sh
+bash experiments/hh/7b_ppo_tre_k.sh
 ```
 
 **TRE-P (Ours)**
@@ -193,9 +201,14 @@ bash experiments/hh/1.5b_ppo_tre_p.sh
 bash experiments/hh/7b_ppo_tre_p.sh
 ```
 
+</details>
+
 ---
 
 ## 💡 Implementation Details
+
+<details>
+<summary>Click to expand</summary>
 
 You can view [this commit](https://github.com/WhyChaos/TRE-Encouraging-Exploration-in-the-Trust-Region/commit/5546077a7599f31ad618a1801337edd3d9986172) to see how we adapted [verl 0.4.x](https://github.com/verl-project/verl/tree/v0.4.x) for our experiments.
 
@@ -206,6 +219,8 @@ You can view [this commit](https://github.com/WhyChaos/TRE-Encouraging-Explorati
 | **KL-COV Baseline** | [`verl/trainer/ppo/core_algos.py`](verl/trainer/ppo/core_algos.py#L519) | 519 |
 | **Forking Tokens Baseline** | [`verl/trainer/ppo/core_algos.py`](verl/trainer/ppo/core_algos.py#L706) | 706 |
 | **TRE (Ours)** | [`verl/utils/torch_functional.py`](verl/utils/torch_functional.py#L125) | 125 |
+
+</details>
 
 ---
 
