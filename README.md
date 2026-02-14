@@ -27,6 +27,13 @@ We propose **Trust Region Entropy (TRE)**, a novel exploration regularization te
 <details>
 <summary>Click to expand</summary>
 
+#### 1. Create a Conda Environment
+```bash
+conda create -n tre python=3.10
+conda activate tre
+```
+
+#### 2. Install Dependencies
 Our code is based on [verl 0.4.x](https://github.com/verl-project/verl/tree/v0.4.x). Please follow the instructions in the original [`README_verl.md`](README_verl.md) for environment installation.
 
 </details>
